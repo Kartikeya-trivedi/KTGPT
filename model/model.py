@@ -232,9 +232,9 @@ class MLAAttention(nn.Module):
         # ── 6. Scaled dot-product attention ────────────────────────
         # Transpose to (B, H, S/kv_len, D) for F.scaled_dot_product_attention
         q_full = torch.cat([q_nope, q_rope], dim=-1)
-        q_full = q_full.transpose(1, 2)                       # (B, H, S, head_dim)
-        k = k.transpose(1, 2)                                 # (B, H, kv_len, head_dim)
-        v = v.transpose(1, 2)                                 # (B, H, kv_len, v_head_dim)
+        q_full = q_full.transpose(1, 2).contiguous()                       # (B, H, S, head_dim)
+        k = k.transpose(1, 2).contiguous()                                 # (B, H, kv_len, head_dim)
+        v = v.transpose(1, 2).contiguous()                                 # (B, H, kv_len, v_head_dim)
 
         # Use causal mask only when not using cache (full prefill)
         # During generation with cache, S=1 and causal is implicit.
@@ -360,7 +360,8 @@ class MoERouter(nn.Module):
 
         This is a direct scalar update — no gradient, no loss, no backprop.
         """
-        threshold = total_tokens / self.num_routed_experts
+        # Multiply total_tokens by top_k because each token selects top_k experts
+        threshold = (total_tokens * self.top_k) / self.num_routed_experts
         overloaded = expert_counts > threshold
         underloaded = expert_counts < threshold
         self.expert_bias[overloaded] -= self.bias_update_speed
@@ -391,11 +392,18 @@ class MoEFFN(nn.Module):
         # Shared expert — always active
         self.shared_expert = SwiGLUExpert(config.hidden_dim, config.expert_ffn_dim)
 
-        # Routed experts
-        self.routed_experts = nn.ModuleList([
-            SwiGLUExpert(config.hidden_dim, config.expert_ffn_dim)
-            for _ in range(config.num_routed_experts)
-        ])
+        # Routed experts (Batched for performance)
+        # Instead of 37 separate Linear layers, we stack all weights into single tensors
+        # shape: (num_experts, out_features, in_features)
+        self.expert_gate_weight = nn.Parameter(
+            torch.empty(config.num_routed_experts, config.expert_ffn_dim, config.hidden_dim)
+        )
+        self.expert_up_weight = nn.Parameter(
+            torch.empty(config.num_routed_experts, config.expert_ffn_dim, config.hidden_dim)
+        )
+        self.expert_down_weight = nn.Parameter(
+            torch.empty(config.num_routed_experts, config.hidden_dim, config.expert_ffn_dim)
+        )
 
         self.router = MoERouter(config)
 
@@ -415,34 +423,61 @@ class MoEFFN(nn.Module):
         top_indices, top_scores, expert_counts = self.router(x_flat)
         # top_indices: (T, top_k)    top_scores: (T, top_k)
 
-        # ── Execute routed experts ─────────────────────────────────
-        # Accumulate weighted expert outputs
+        # ── Execute routed experts (Batched) ───────────────────────
+        flat_indices = top_indices.flatten()
+        flat_x = x_flat.repeat_interleave(self.config.top_k, dim=0)
+        flat_scores = top_scores.flatten()
+
+        # Sort tokens by expert assignment
+        sorted_experts, sorted_idx = torch.sort(flat_indices)
+        sorted_x = flat_x[sorted_idx]
+        sorted_scores = flat_scores[sorted_idx]
+
+        # Count tokens per expert and find boundaries
+        true_counts = torch.bincount(sorted_experts, minlength=self.config.num_routed_experts)
+        true_starts = torch.zeros(self.config.num_routed_experts, device=x.device, dtype=torch.long)
+        true_starts[1:] = true_counts.cumsum(0)[:-1]
+
+        # Position of each token within its assigned expert's group
+        token_pos_in_group = torch.arange(T * self.config.top_k, device=x.device) - true_starts[sorted_experts]
+
+        # Create padded tensor: (num_experts, max_tokens, D)
+        max_tokens = true_counts.max().item()
+        if max_tokens == 0:
+            max_tokens = 1
+            
+        padded_x = torch.zeros((self.config.num_routed_experts, max_tokens, D), device=x.device, dtype=x.dtype)
+        padded_x[sorted_experts, token_pos_in_group] = sorted_x
+
+        # Batched matmuls: (E, max_tokens, D) @ (E, D, F) -> (E, max_tokens, F)
+        # Optional LoRA adapters can inject low-rank deltas on routed experts.
+        expert_gate_weight = self.expert_gate_weight
+        expert_up_weight = self.expert_up_weight
+        expert_down_weight = self.expert_down_weight
+        if hasattr(self, "lora_expert_gate_weight"):
+            expert_gate_weight = expert_gate_weight + self.lora_expert_gate_weight.delta(expert_gate_weight.dtype)
+        if hasattr(self, "lora_expert_up_weight"):
+            expert_up_weight = expert_up_weight + self.lora_expert_up_weight.delta(expert_up_weight.dtype)
+        if hasattr(self, "lora_expert_down_weight"):
+            expert_down_weight = expert_down_weight + self.lora_expert_down_weight.delta(expert_down_weight.dtype)
+
+        gate = torch.bmm(padded_x, expert_gate_weight.transpose(1, 2))
+        up = torch.bmm(padded_x, expert_up_weight.transpose(1, 2))
+        h = F.silu(gate) * up
+        exp_out_padded = torch.bmm(h, expert_down_weight.transpose(1, 2))
+
+        # Extract valid tokens back to flat shape
+        exp_out_flat = exp_out_padded[sorted_experts, token_pos_in_group]
+        
+        # Weight by router scores
+        exp_out_flat = exp_out_flat * sorted_scores.unsqueeze(-1)
+
+        # Scatter back to original token ordering
+        token_indices_orig = torch.arange(T, device=x.device).repeat_interleave(self.config.top_k)
+        sorted_token_indices = token_indices_orig[sorted_idx]
+        
         routed_out = torch.zeros_like(x_flat)
-
-        for expert_idx in range(self.config.num_routed_experts):
-            expert = self.routed_experts[expert_idx]
-
-            # Find which tokens selected this expert, and in which slot
-            # mask: (T, top_k) boolean
-            mask = top_indices == expert_idx
-            if not mask.any():
-                continue
-
-            # Get token indices that route to this expert
-            token_mask = mask.any(dim=-1)                      # (T,)
-            token_indices = token_mask.nonzero(as_tuple=True)[0]
-
-            # Gather the score for this expert per selected token
-            # A token may select this expert in slot 0 or slot 1
-            scores_for_expert = (top_scores * mask.to(top_scores.dtype)).sum(dim=-1)  # (T,)
-            selected_scores = scores_for_expert[token_indices]  # (num_selected,)
-
-            # Run expert on selected tokens
-            expert_input = x_flat[token_indices]
-            expert_output = expert(expert_input)               # (num_selected, D)
-
-            # Weighted accumulation
-            routed_out[token_indices] += selected_scores.unsqueeze(-1) * expert_output
+        routed_out.scatter_add_(0, sorted_token_indices.unsqueeze(-1).expand(-1, D), exp_out_flat)
 
         # ── Execute shared expert on ALL tokens ────────────────────
         shared_out = self.shared_expert(x_flat)
@@ -547,8 +582,7 @@ class KTGPT(nn.Module):
         for layer in self.layers:
             layer.attn.out_proj.weight.data.mul_(output_scale)
             layer.ffn.shared_expert.down_proj.weight.data.mul_(output_scale)
-            for expert in layer.ffn.routed_experts:
-                expert.down_proj.weight.data.mul_(output_scale)
+            layer.ffn.expert_down_weight.data.mul_(output_scale)
 
         # Tie embedding and LM head weights
         self.lm_head.weight = self.embed.weight
@@ -561,6 +595,9 @@ class KTGPT(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.init_std)
+        elif isinstance(module, nn.Parameter) and len(module.shape) >= 2:
+            # For batched expert weights
+            nn.init.normal_(module, mean=0.0, std=self.config.init_std)
 
     def forward(
         self,
@@ -597,3 +634,82 @@ class KTGPT(nn.Module):
         logits = self.lm_head(x)
 
         return logits, new_caches if use_cache else None
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_p: float = 1.0,
+        top_k: int = 50,
+        repetition_penalty: float = 1.2,
+        eos_token_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Autoregressive generation with KV caching and repetition penalty.
+        
+        Args:
+            input_ids: (batch, seq_len)
+            max_new_tokens: how many tokens to generate
+            temperature: 1.0 = normal, <1.0 = focused, >1.0 = creative
+            top_p: nucleus sampling threshold
+            top_k: only sample from top K tokens
+            repetition_penalty: >1.0 penalizes repeated tokens
+            eos_token_id: stop generating if this token is produced
+        """
+        B, S = input_ids.shape
+        curr_ids = input_ids
+        past_kv_list = None
+        
+        for _ in range(max_new_tokens):
+            model_input = curr_ids if past_kv_list is None else curr_ids[:, -1:]
+            
+            logits, past_kv_list = self.forward(
+                model_input, 
+                use_cache=True, 
+                past_kv_list=past_kv_list
+            )
+            
+            next_token_logits = logits[:, -1, :].clone()
+            
+            # 1. Repetition Penalty
+            if repetition_penalty != 1.0:
+                for b in range(B):
+                    # For each token in the sequence, penalize its logit
+                    for token_id in set(curr_ids[b].tolist()):
+                        if next_token_logits[b, token_id] > 0:
+                            next_token_logits[b, token_id] /= repetition_penalty
+                        else:
+                            next_token_logits[b, token_id] *= repetition_penalty
+
+            # 2. Temperature scaling
+            if temperature != 1.0:
+                next_token_logits = next_token_logits / temperature
+                
+            # 3. Top-K Sampling
+            if top_k > 0:
+                indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
+                next_token_logits[indices_to_remove] = float('-inf')
+
+            # 4. Top-P (Nucleus) Sampling
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                next_token_logits[indices_to_remove] = float('-inf')
+
+            # 5. Final Sampling
+            probs = F.softmax(next_token_logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            
+            curr_ids = torch.cat([curr_ids, next_token], dim=-1)
+            
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
+                
+        return curr_ids

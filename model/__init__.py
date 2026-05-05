@@ -10,6 +10,7 @@ from model.model import (
     RMSNorm,
     RotaryEmbedding,
 )
+from model.lora import LoRAConfig, LoRALinear, inject_lora
 
 __all__ = [
     "KTGPTConfig",
@@ -21,4 +22,7 @@ __all__ = [
     "SwiGLUExpert",
     "RMSNorm",
     "RotaryEmbedding",
+    "LoRAConfig",
+    "LoRALinear",
+    "inject_lora",
 ]

@@ -35,16 +35,17 @@ class SFTConfig(TrainConfig):
     lower LR, shorter training, smaller batch.
     """
     phase: int = 3
-    lr: float = 5e-5
+    lr: float = 5e-6
     min_lr: float = 1e-6
-    warmup_steps: int = 200
+    warmup_steps: int = 50
     weight_decay: float = 0.01
     grad_accum_steps: int = 8
     micro_batch_size: int = 4
-    seq_len: int = 4096
-    num_epochs: int = 2
-    wandb_run_name: str = "sft"
-    sft_data_path: str = "./data/synth_output.jsonl"
+    seq_len: int = 512         # overridden per stage: 128 for math, 512 for instruct/RAG/tool
+    num_epochs: int = 10
+    checkpoint_every: int = 200
+    wandb_run_name: str = "sft-phase1-alignment"
+    sft_data_path: str = "data/phase1_sft.jsonl"
 
     # These will be computed from data size
     total_tokens: int = 0
@@ -75,7 +76,7 @@ class SFTDataset(Dataset):
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 sample = json.loads(line.strip())
-                if "text" in sample:
+                if "prompt" in sample and "response" in sample:
                     self.samples.append(sample)
 
         print(f"[SFT] Loaded {len(self.samples)} training samples from {data_path}")
@@ -84,28 +85,47 @@ class SFTDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        text = self.samples[idx]["text"]
-        token_ids = self.tokenizer.encode(text, add_special_tokens=True)
+        sample = self.samples[idx]
+        prompt = sample["prompt"]
+        response = sample["response"]
+        
+        # Mistral Instruct Format exactly as requested
+        formatted_prompt = f"[INST] {prompt.strip()} [/INST]\n"
+        formatted_response = f"{response.strip()}"
+        
+        prompt_ids = [self.tokenizer.bos_token_id] + self.tokenizer.encode(formatted_prompt, add_special_tokens=False)
+        response_ids = self.tokenizer.encode(formatted_response, add_special_tokens=False) + [self.tokenizer.eos_token_id]
+        
+        token_ids = prompt_ids + response_ids
+        
+        # Labels: -100 for prompt, actual ids for response
+        labels = [-100] * len(prompt_ids) + response_ids
 
         # Truncate to seq_len
         if len(token_ids) > self.seq_len:
             token_ids = token_ids[:self.seq_len]
+            labels = labels[:self.seq_len]
 
         # Pad to seq_len
         pad_len = self.seq_len - len(token_ids)
         if pad_len > 0:
             pad_id = self.tokenizer.pad_token_id or 0
             token_ids = token_ids + [pad_id] * pad_len
+            labels = labels + [-100] * pad_len
 
-        ids = torch.tensor(token_ids, dtype=torch.long)
-        return {"input_ids": ids, "labels": ids.clone()}
+        ids_tensor = torch.tensor(token_ids, dtype=torch.long)
+        labels_tensor = torch.tensor(labels, dtype=torch.long)
+        
+        return {"input_ids": ids_tensor, "labels": labels_tensor}
 
 
 def run_sft(
     checkpoint_path: str,
-    sft_data_path: str = "./data/synth_output.jsonl",
-    output_dir: str = "./checkpoints/sft",
-    num_epochs: int = 2,
+    sft_data_path: str = "data/phase1_sft.jsonl",
+    output_dir: str = "checkpoints/sft_phase1",
+    num_epochs: int = 1,
+    seq_len: int = 512,
+    lr: float = 5e-6,
 ) -> None:
     """Run SFT training on synthetic data.
 
@@ -116,11 +136,29 @@ def run_sft(
         num_epochs: Number of training epochs
     """
     from data.mix import get_tokenizer
+    import os
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Enable TF32 for speed
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    # DDP Initialization
+    is_ddp = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    if is_ddp:
+        import torch.distributed as dist
+        dist.init_process_group("nccl")
+        local_rank = int(os.environ["LOCAL_RANK"])
+        global_rank = int(os.environ["RANK"])
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+    else:
+        local_rank = 0
+        global_rank = 0
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load model from pretrained checkpoint
     model_config = KTGPTConfig()
+    model_config.max_seq_len = 2048
     model = KTGPT(model_config).to(device=device, dtype=torch.bfloat16)
 
     # Load pretrained weights
@@ -131,15 +169,19 @@ def run_sft(
     # Tokenizer
     tokenizer = get_tokenizer()
 
-    # Dataset
-    dataset = SFTDataset(sft_data_path, tokenizer, seq_len=model_config.max_seq_len)
-
-    # Config
+    # Config — set total_tokens to cover all epochs so Trainer runs once
     sft_config = SFTConfig()
     sft_config.sft_data_path = sft_data_path
     sft_config.checkpoint_dir = output_dir
     sft_config.num_epochs = num_epochs
-    sft_config.total_tokens = len(dataset) * model_config.max_seq_len * num_epochs
+    sft_config.seq_len = seq_len
+    sft_config.lr = lr
+    sft_config.min_lr = lr * 0.1
+    print(f"[SFT] seq_len={seq_len}, lr={lr:.2e}")
+
+    # Dataset
+    dataset = SFTDataset(sft_data_path, tokenizer, seq_len=sft_config.seq_len)
+    sft_config.total_tokens = len(dataset) * sft_config.seq_len * num_epochs
 
     # DataLoader
     dataloader = DataLoader(
@@ -147,15 +189,33 @@ def run_sft(
         batch_size=sft_config.micro_batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=2,
+        num_workers=8,
     )
 
-    # Train
-    trainer = Trainer(model=model, config=sft_config, device=device)
+    # Train — use a single train() call with an epoch-repeating iterator
+    # so wandb.init/finish are called exactly once
+    trainer = Trainer(
+        model=model, 
+        config=sft_config, 
+        device=device,
+        is_ddp=is_ddp,
+        global_rank=global_rank,
+        local_rank=local_rank
+    )
 
-    for epoch in range(num_epochs):
-        print(f"\n[SFT] Epoch {epoch + 1}/{num_epochs}")
-        trainer.train(dataloader)
+    import itertools
+
+    class _EpochRepeater:
+        """Wraps a DataLoader to repeat for num_epochs."""
+        def __init__(self, dl, epochs):
+            self.dl = dl
+            self.epochs = epochs
+        def __iter__(self):
+            for epoch in range(self.epochs):
+                print(f"\n[SFT] Epoch {epoch + 1}/{self.epochs}")
+                yield from self.dl
+
+    trainer.train(_EpochRepeater(dataloader, num_epochs))
 
     print(f"\n[SFT] Training complete. Checkpoints saved to {output_dir}")
 
@@ -164,9 +224,11 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="KT_GPT Supervised Fine-Tuning")
     parser.add_argument("--checkpoint", required=True, help="Pretrained checkpoint path")
-    parser.add_argument("--data", default="./data/synth_output.jsonl")
-    parser.add_argument("--output-dir", default="./checkpoints/sft")
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--data", default="data/phase1_sft.jsonl")
+    parser.add_argument("--output-dir", default="checkpoints/sft_phase1")
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--seq-len", type=int, default=512, help="Sequence length (use 128 for math stages)")
+    parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate (use 2e-5 for math stages)")
     args = parser.parse_args()
 
-    run_sft(args.checkpoint, args.data, args.output_dir, args.epochs)
+    run_sft(args.checkpoint, args.data, args.output_dir, args.epochs, args.seq_len, args.lr)

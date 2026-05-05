@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 
 from data.filter import execute_with_tests
 
@@ -102,17 +103,25 @@ class SyntheticDataGenerator:
         """Generate N candidate solutions for a given problem prompt."""
         candidates: list[str] = []
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        eos_id = self.tokenizer.eos_token_id
 
         for _ in range(self.config.num_candidates):
+            generated = input_ids.clone()
+
             with torch.no_grad():
-                output = self.model.generate(
-                    input_ids,
-                    max_new_tokens=self.config.max_new_tokens,
-                    temperature=self.config.temperature,
-                    do_sample=True,
-                    top_p=0.95,
-                )
-            text = self.tokenizer.decode(output[0][input_ids.shape[1]:], skip_special_tokens=True)
+                for _ in range(self.config.max_new_tokens):
+                    with torch.amp.autocast(device_type=self.device.type, dtype=torch.bfloat16):
+                        logits, _ = self.model(generated)
+
+                    next_logits = logits[:, -1, :] / self.config.temperature
+                    probs = F.softmax(next_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    generated = torch.cat([generated, next_token], dim=1)
+
+                    if next_token.item() == eos_id:
+                        break
+
+            text = self.tokenizer.decode(generated[0][input_ids.shape[1]:], skip_special_tokens=True)
             candidates.append(text)
 
         return candidates

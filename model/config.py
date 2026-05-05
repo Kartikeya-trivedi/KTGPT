@@ -55,6 +55,7 @@ class KTGPTConfig:
     dropout: float = 0.0
     bias_update_speed: float = 0.001
     init_std: float = 0.02
+    gradient_checkpointing: bool = False
 
     # ──────────────────────────────────────────────────────────────────
 

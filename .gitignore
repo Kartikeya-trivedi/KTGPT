@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+.pytest_cache/
+
+# Git index lock
+.git/index.lock
+
+# Weights & Biases
+wandb/
+
+# Models & Checkpoints (all PyTorch/Weights files)
+*.pt
+*.pth
+*.bin
+checkpoints/
+
+# Datasets & Large Data Files
+*.jsonl
+*.csv
+*.tsv
+data/raw/

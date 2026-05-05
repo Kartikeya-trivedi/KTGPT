@@ -41,13 +41,18 @@ image = (
         "zstandard>=0.22.0",
         "wandb>=0.16.0",
         "accelerate>=0.25.0",
-        gpu="A10G",                 # ensures CUDA-enabled torch is installed
+        gpu="A100",                 # ensures CUDA-enabled torch is installed
     )
     # Mount the project source code into the container
     .add_local_dir(
         ".",
         remote_path="/root/kt-gpt",
-        ignore=["**/__pycache__", "**/.venv", "**/checkpoints", "**/.git"],
+        ignore=[
+            "**/__pycache__", "**/.venv", "**/checkpoints", "**/.git", 
+            "**/node_modules", "**/venv", "**/.gemini", 
+            "**/.ipynb_checkpoints", "**/*.jsonl", "**/*.pt",
+            "**/weights", "**/ktgpt_chat"
+        ],
     )
 )
 
@@ -64,7 +69,7 @@ CHECKPOINT_MOUNT = "/checkpoints"
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.function(
-    gpu="A10G",
+    gpu="A100-80GB",
     timeout=300,              # 5 minutes max — should finish in ~30s
     image=image,
     secrets=[
@@ -73,6 +78,7 @@ CHECKPOINT_MOUNT = "/checkpoints"
     ],
     volumes={CHECKPOINT_MOUNT: checkpoint_volume},
     memory=32768,
+    cpu=8.0,
 )
 def test_setup() -> str:
     """Quick sanity check: GPU, secrets, imports, model init, fwd/bwd, volume I/O.
@@ -165,7 +171,26 @@ def test_setup() -> str:
     sample_text = tokenizer.decode(ids[0, :200].tolist(), skip_special_tokens=False)
     results.append(f"\n📄 Sample batch (first 200 tokens decoded):\n{'─'*60}\n{sample_text}\n{'─'*60}")
 
-    # ── 7. Volume I/O Check ───────────────────────────────────────
+    # ── 7. W&B Init Check ─────────────────────────────────────────
+    try:
+        import wandb
+        run = wandb.init(
+            project="kt-gpt",
+            name="phase0-dry-run",
+            tags=["dry-run"],
+            config={
+                "phase": 0,
+                "total_params": total_params,
+                "gpu": gpu_name,
+            },
+        )
+        assert run is not None, "wandb.init returned None"
+        wandb.finish()
+        results.append(f"✅ wandb.init: authenticated & run created successfully")
+    except Exception as e:
+        results.append(f"❌ wandb.init FAILED: {e}")
+
+    # ── 8. Volume I/O Check ───────────────────────────────────────
     test_file = os.path.join(CHECKPOINT_MOUNT, "_dry_run_test.txt")
     with open(test_file, "w") as f:
         f.write("dry-run OK")
@@ -174,7 +199,7 @@ def test_setup() -> str:
     os.remove(test_file)
     results.append(f"✅ Volume I/O: write/read/delete at {CHECKPOINT_MOUNT}")
 
-    # ── 8. Cleanup ────────────────────────────────────────────────
+    # ── 9. Cleanup ────────────────────────────────────────────────
     del model, dummy_input, logits, loss
     torch.cuda.empty_cache()
 
@@ -191,7 +216,7 @@ def test_setup() -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.function(
-    gpu="A10G",
+    gpu="A100-80GB:4",
     timeout=36000,           # 10 hours max
     image=image,
     secrets=[
@@ -200,9 +225,10 @@ def test_setup() -> str:
     ],
     volumes={CHECKPOINT_MOUNT: checkpoint_volume},
     memory=32768,            # 32GB system RAM for data loading
+    cpu=8.0,
 )
 def train_phase1() -> str:
-    """Launch Phase 1 pretraining: 1B tokens, lr=3e-4, FineWeb-Edu + DCLM.
+    """Launch Phase 1 pretraining: 1B tokens, lr=3e-4, FineWeb-Edu + DCLM using 4-GPU DDP.
 
     Automatically resumes from latest checkpoint if a previous run was
     interrupted. Checkpoints are saved to the persistent volume every
@@ -210,49 +236,16 @@ def train_phase1() -> str:
 
     Returns a status message on completion.
     """
-    import sys
-    sys.path.insert(0, "/root/kt-gpt")
-
-    import torch
-    from model.config import KTGPTConfig
-    from model.model import KTGPT
-    from train.pretrain import Trainer, TrainConfig
-    from data.mix import create_dataloader
-
-    device = torch.device("cuda")
-    print(f"GPU: {torch.cuda.get_device_name()}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-
-    # ── Model ──────────────────────────────────────────────────────
-    model_config = KTGPTConfig()
-    model = KTGPT(model_config).to(device=device, dtype=torch.bfloat16)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {total_params / 1e6:.1f}M")
-
-    # ── Training config ────────────────────────────────────────────
-    train_config = TrainConfig.phase1()
-    train_config.checkpoint_dir = CHECKPOINT_MOUNT
-
-    # ── Data ───────────────────────────────────────────────────────
-    dataloader = create_dataloader(
-        phase=1,
-        batch_size=train_config.micro_batch_size,
-        seq_len=train_config.seq_len,
-        total_tokens=train_config.total_tokens,
-        seed=train_config.seed,
-        num_workers=train_config.num_workers,
+    import subprocess
+    import os
+    print("Launching Phase 1 DDP on 4 GPUs...")
+    subprocess.run(
+        ["torchrun", "--nproc_per_node=4", "-m", "train.pretrain", "--phase", "1", "--checkpoint-dir", CHECKPOINT_MOUNT],
+        check=True,
+        cwd="/root/kt-gpt",
+        env={**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     )
-
-    # ── Trainer ────────────────────────────────────────────────────
-    trainer = Trainer(model=model, config=train_config, device=device)
-    trainer.load_checkpoint()  # auto-resume if checkpoint exists
-
-    trainer.train(dataloader)
-
-    # Commit volume to persist checkpoints
-    checkpoint_volume.commit()
-
-    return f"Phase 1 complete. Steps: {trainer.global_step}, Tokens: {trainer.tokens_seen:,}"
+    return "Phase 1 Complete"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -260,7 +253,7 @@ def train_phase1() -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.function(
-    gpu="A10G",
+    gpu="A100-80GB:4",
     timeout=36000,           # 10 hours — may need multiple runs for 20B
     image=image,
     secrets=[
@@ -269,61 +262,179 @@ def train_phase1() -> str:
     ],
     volumes={CHECKPOINT_MOUNT: checkpoint_volume},
     memory=32768,
+    cpu=8.0,
 )
 def train_phase2() -> str:
-    """Launch Phase 2 pretraining: 20B tokens, lr=1e-4, full data mix.
+    """Launch Phase 2 pretraining: 20B tokens, lr=1e-4, full data mix using 4-GPU DDP.
 
     Loads the Phase 1 checkpoint as initialization, then trains with the
-    full data mix (Stack v2 + FineWeb + DCLM + OpenWebMath).
-
-    If a Phase 2 checkpoint exists, resumes from it instead.
-    This allows multi-run training across Modal timeout boundaries.
-
-    Returns a status message on completion.
+    full data mix. Returns a status message on completion.
     """
-    import sys
-    sys.path.insert(0, "/root/kt-gpt")
+    import subprocess
+    import os
+    print("Launching Phase 2 DDP on 4 GPUs...")
+    subprocess.run(
+        ["torchrun", "--nproc_per_node=4", "-m", "train.pretrain", "--phase", "2", "--checkpoint-dir", CHECKPOINT_MOUNT],
+        check=True,
+        cwd="/root/kt-gpt",
+        env={**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    )
+    return "Phase 2 Complete"
 
-    import torch
-    from model.config import KTGPTConfig
-    from model.model import KTGPT
-    from train.pretrain import Trainer, TrainConfig
-    from data.mix import create_dataloader
 
-    device = torch.device("cuda")
-    print(f"GPU: {torch.cuda.get_device_name()}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+@app.function(
+    gpu="A100-80GB",
+    timeout=36000,
+    image=image,
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    volumes={CHECKPOINT_MOUNT: checkpoint_volume},
+    memory=32768,
+    cpu=8.0,
+)
+def train_sft_stage(
+    stage_name: str,
+    data_file: str,
+    input_ckpt: str,
+    output_dir: str,
+    epochs: int = 3,
+    checkpoint_every: int = 100,
+    seq_len: int = 512,
+    lr: float = 5e-6,
+) -> str:
+    """Generic SFT stage runner for the curriculum pipeline."""
+    import subprocess
+    import os
+    print(f"Launching SFT {stage_name} on Single GPU...")
+    print(f"  Input:   {input_ckpt}")
+    print(f"  Data:    {data_file}")
+    print(f"  Output:  {output_dir}")
+    print(f"  Epochs:  {epochs}, seq_len={seq_len}, lr={lr:.2e}")
+    subprocess.run(
+        ["python", "-m", "train.sft",
+         "--checkpoint", input_ckpt,
+         "--data", data_file,
+         "--output-dir", output_dir,
+         "--epochs", str(epochs),
+         "--seq-len", str(seq_len),
+         "--lr", str(lr)],
+        check=True,
+        cwd="/root/kt-gpt",
+        env={**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    )
+    return f"SFT {stage_name} Complete"
 
-    # ── Model ──────────────────────────────────────────────────────
-    model_config = KTGPTConfig()
-    model = KTGPT(model_config).to(device=device, dtype=torch.bfloat16)
 
-    # ── Training config ────────────────────────────────────────────
-    train_config = TrainConfig.phase2()
-    train_config.checkpoint_dir = CHECKPOINT_MOUNT
+@app.function(
+    gpu="A100-80GB",
+    timeout=36000,
+    image=image,
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    volumes={CHECKPOINT_MOUNT: checkpoint_volume},
+    memory=32768,
+    cpu=8.0,
+)
+def train_grpo() -> str:
+    """Launch Stage 3 GRPO using a single powerful GPU."""
+    import subprocess
+    import os
+    print("Launching Stage 3 GRPO on Single GPU...")
+    subprocess.run(
+        ["python", "-m", "train.grpo",
+         "--checkpoint", f"{CHECKPOINT_MOUNT}/sft_stage2/phase3/final.pt",
+         "--output_dir", f"{CHECKPOINT_MOUNT}/grpo"],
+        check=True,
+        cwd="/root/kt-gpt",
+        env={**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    )
+    return "Stage 3 GRPO Complete"
 
-    # ── Data ───────────────────────────────────────────────────────
-    dataloader = create_dataloader(
-        phase=2,
-        batch_size=train_config.micro_batch_size,
-        seq_len=train_config.seq_len,
-        total_tokens=train_config.total_tokens,
-        seed=train_config.seed,
-        num_workers=train_config.num_workers,
+
+@app.function(
+    gpu="A100-80GB",
+    timeout=36000,
+    image=image,
+    secrets=[
+        modal.Secret.from_name("wandb-secret"),
+        modal.Secret.from_name("hf-secret"),
+    ],
+    volumes={CHECKPOINT_MOUNT: checkpoint_volume},
+    memory=32768,
+    cpu=8.0,
+)
+def train_sft_lora(
+    input_ckpt: str,
+    data_file: str,
+    output_dir: str,
+    epochs: int = 1,
+    seq_len: int = 512,
+    lr: float = 1e-4,
+) -> str:
+    """Launch LoRA SFT Training."""
+    import subprocess
+    import os
+    print("Launching LoRA SFT on Single GPU...")
+    print(f"  Input:   {input_ckpt}")
+    print(f"  Data:    {data_file}")
+    print(f"  Output:  {output_dir}")
+    subprocess.run(
+        ["python", "-m", "train.sft_lora",
+         "--checkpoint", input_ckpt,
+         "--data", data_file,
+         "--output-dir", output_dir,
+         "--epochs", str(epochs),
+         "--seq-len", str(seq_len),
+         "--lr", str(lr)],
+        check=True,
+        cwd="/root/kt-gpt",
+        env={**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    )
+    return "LoRA SFT Complete"
+
+
+@app.function(
+    gpu="A100-80GB",
+    image=image,
+    volumes={CHECKPOINT_MOUNT: checkpoint_volume},
+)
+def eval_lora(checkpoint_path: str):
+    """Run the eval script on Modal."""
+    import subprocess
+    import os
+    print(f"Running LoRA Evaluation...")
+    subprocess.run(
+        ["python", "scripts/eval_lora.py", 
+         "--checkpoint", checkpoint_path],
+        check=True,
+        cwd="/root/kt-gpt",
     )
 
-    # ── Trainer ────────────────────────────────────────────────────
-    trainer = Trainer(model=model, config=train_config, device=device)
 
-    # Try Phase 2 resume first; if none, load Phase 1 final weights
-    if not trainer.load_checkpoint():
-        if not trainer.load_phase1_checkpoint():
-            print("WARNING: No Phase 1 checkpoint found. Training from scratch.")
 
-    trainer.train(dataloader)
-    checkpoint_volume.commit()
+# ═══════════════════════════════════════════════════════════════════════
+#  Pipeline Stage Definitions
+# ═══════════════════════════════════════════════════════════════════════
 
-    return f"Phase 2 complete. Steps: {trainer.global_step}, Tokens: {trainer.tokens_seen:,}"
+# fmt: off
+PIPELINE_STAGES = {
+    # code:  (stage_name,  data_file,                                                                  input_checkpoint,                                          output_dir,                          epochs, ckpt_every, seq_len, lr)
+    "30a":  ("Stage 0A",  f"{CHECKPOINT_MOUNT}/data/pipeline/stage0a_basic_math.jsonl",              f"{CHECKPOINT_MOUNT}/phase2/final.pt",                    f"{CHECKPOINT_MOUNT}/sft_stage0a",   5,  100, 128, 2e-5),
+    "30b":  ("Stage 0B",  f"{CHECKPOINT_MOUNT}/data/pipeline/stage0b_expanded_math.jsonl",           f"{CHECKPOINT_MOUNT}/sft_stage0a/phase3/final.pt",       f"{CHECKPOINT_MOUNT}/sft_stage0b",   5,   50, 128, 2e-5),
+    "30c":  ("Stage 0C",  f"{CHECKPOINT_MOUNT}/data/pipeline/stage0c_multistep_math.jsonl",          f"{CHECKPOINT_MOUNT}/sft_stage0b/phase3/final.pt",       f"{CHECKPOINT_MOUNT}/sft_stage0c",   5,  200, 128, 2e-5),
+    "31":   ("Stage 1",   f"{CHECKPOINT_MOUNT}/data/pipeline/stage1_instruct.jsonl",                 f"{CHECKPOINT_MOUNT}/sft_stage0c/phase3/final.pt",       f"{CHECKPOINT_MOUNT}/sft_stage1",    2,  200, 512, 5e-6),
+    "315":  ("Stage 1.5", f"{CHECKPOINT_MOUNT}/data/pipeline/stage1_5_context_grounding.jsonl",      f"{CHECKPOINT_MOUNT}/sft_stage1/phase3/final.pt",        f"{CHECKPOINT_MOUNT}/sft_stage1_5",  2,  200, 512, 5e-6),
+    "32":   ("Stage 2",   f"{CHECKPOINT_MOUNT}/data/pipeline/stage2_function_calling.jsonl",         f"{CHECKPOINT_MOUNT}/sft_stage1_5/phase3/final.pt",      f"{CHECKPOINT_MOUNT}/sft_stage2",    2,  200, 512, 5e-6),
+    "lora": ("LoRA SFT",  f"{CHECKPOINT_MOUNT}/data/lora_final.jsonl",                               f"{CHECKPOINT_MOUNT}/phase2/final.pt",                   f"{CHECKPOINT_MOUNT}/sft_lora",      1,  None, 512, 1e-4),
+    "eval": ("Eval LoRA", None, None, None, None, None, None, None),
+    "base_eval": ("Eval Base", None, None, None, None, None, None, None),
+    "4":    ("Stage 3 GRPO", None, None, None, None, None, None, None),  # handled separately
+}
+# fmt: on
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -331,25 +442,55 @@ def train_phase2() -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.local_entrypoint()
-def main(phase: int = 1) -> None:
+def main(phase: str = "1") -> None:
     """Launch training from the command line.
 
     Usage:
-        modal run modal_train.py --phase 1
-        modal run modal_train.py --phase 2
+        modal run modal_train.py --phase 0    (dry run)
+        modal run modal_train.py --phase 1    (Phase 1 pretrain)
+        modal run modal_train.py --phase 2    (Phase 2 pretrain)
+        modal run modal_train.py --phase 30a  (SFT Stage 0A: basic math)
+        modal run modal_train.py --phase 30b  (SFT Stage 0B: expanded math)
+        modal run modal_train.py --phase 30c  (SFT Stage 0C: multi-step)
+        modal run modal_train.py --phase 31   (SFT Stage 1: instruction)
+        modal run modal_train.py --phase 315  (SFT Stage 1.5: context/RAG)
+        modal run modal_train.py --phase 32   (SFT Stage 2: function calling)
+        modal run modal_train.py --phase lora (LoRA SFT on Phase 2 Base)
+        modal run modal_train.py --phase eval (Run LoRA Evaluation)
+        modal run modal_train.py --phase base_eval (Run Base Model Evaluation)
+        modal run modal_train.py --phase 4    (GRPO: tool decision RL)
     """
     print(f"\nLaunching KT_GPT Phase {phase} training on Modal...")
-    print(f"  GPU: A10G (24GB)")
-    print(f"  Timeout: 10 hours")
     print(f"  Checkpoint volume: kt-gpt-checkpoints\n")
 
-    if phase == 0:
+    if phase == "0":
         result = test_setup.remote()
-    elif phase == 1:
+    elif phase == "1":
         result = train_phase1.remote()
-    elif phase == 2:
+    elif phase == "2":
         result = train_phase2.remote()
+    elif phase == "eval":
+        lora = f"{CHECKPOINT_MOUNT}/sft_lora/phase3/final.pt"
+        result = eval_lora.remote(lora)
+    elif phase == "base_eval":
+        base = f"{CHECKPOINT_MOUNT}/phase2/final.pt"
+        result = eval_lora.remote(base)
+    elif phase in PIPELINE_STAGES:
+        if phase == "4":
+            result = train_grpo.remote()
+        else:
+            stage_name, data_file, input_ckpt, output_dir, epochs, ckpt_every, seq_len, lr = PIPELINE_STAGES[phase]
+            print(f"  Stage:   {stage_name}")
+            print(f"  Data:    {data_file}")
+            print(f"  Input:   {input_ckpt}")
+            print(f"  Output:  {output_dir}")
+            print(f"  Epochs:  {epochs}, seq_len={seq_len}, lr={lr:.2e}")
+            if phase == "lora":
+                result = train_sft_lora.remote(input_ckpt, data_file, output_dir, epochs, seq_len, lr)
+            else:
+                result = train_sft_stage.remote(stage_name, data_file, input_ckpt, output_dir, epochs, ckpt_every, seq_len, lr)
     else:
-        raise ValueError(f"Invalid phase: {phase}. Must be 0, 1, or 2.")
+        valid = ["0", "1", "2"] + list(PIPELINE_STAGES.keys())
+        raise ValueError(f"Invalid phase: {phase}. Must be one of: {valid}")
 
     print(f"\nResult: {result}")

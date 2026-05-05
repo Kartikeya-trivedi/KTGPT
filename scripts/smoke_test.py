@@ -163,7 +163,26 @@ def main() -> None:
         print("   [WARN] Router biases are still zero (may need more tokens for update)")
     print()
 
-    # -- 9. Overall verdict --------------------------------------------------
+    # -- 9. W&B init check ---------------------------------------------------
+    print("9. Verifying wandb.init (disabled mode)...")
+    try:
+        import wandb
+        run = wandb.init(
+            project="kt-gpt",
+            name="smoke-test",
+            mode="disabled",            # no credentials / network needed
+        )
+        assert run is not None, "FAIL: wandb.init returned None"
+        wandb.finish()
+        print("   [OK] wandb.init + finish succeeded (mode=disabled)\n")
+    except ImportError:
+        print("   [FAIL] wandb is not installed")
+        all_ok = False
+    except Exception as e:
+        print(f"   [FAIL] wandb.init raised: {e}")
+        all_ok = False
+
+    # -- 10. Overall verdict -------------------------------------------------
     if all_ok:
         print("=" * 50)
         print("  All checks passed")
@@ -174,7 +193,7 @@ def main() -> None:
         print("=" * 50)
         sys.exit(1)
 
-    # -- 10. GPU memory ------------------------------------------------------
+    # -- 11. GPU memory ------------------------------------------------------
     if device.type == "cuda":
         peak_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
         peak_gb = peak_mb / 1024

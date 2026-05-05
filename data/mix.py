@@ -45,6 +45,7 @@ class DataSourceConfig:
     weight: float                          # sampling probability in the mix
     text_column: str = "text"
     hf_subset: Optional[str] = None
+    data_dir: Optional[str] = None         # specify subdirectories inside the dataset
     split: str = "train"
     filter_column: Optional[str] = None    # e.g. "score" for FineWeb-Edu
     filter_min: Optional[float] = None     # keep rows >= this value
@@ -75,10 +76,12 @@ PHASE_1_SOURCES: list[DataSourceConfig] = [
 
 PHASE_2_SOURCES: list[DataSourceConfig] = [
     DataSourceConfig(
-        name="stack-v2-python",
-        hf_path="bigcode/the-stack-v2-train-smol-ids",
+        name="starcoderdata-python",
+        hf_path="bigcode/starcoderdata",
+        data_dir="python",
         weight=0.40,
         text_column="content",
+        split="train",
     ),
     DataSourceConfig(
         name="fineweb-edu",
@@ -143,6 +146,7 @@ class PackedDataset(IterableDataset):
         seq_len: int = 4096,
         total_tokens: Optional[int] = None,
         seed: int = 42,
+        skip_tokens: int = 0,
     ) -> None:
         super().__init__()
         self.sources = sources
@@ -150,6 +154,7 @@ class PackedDataset(IterableDataset):
         self.seq_len = seq_len
         self.total_tokens = total_tokens
         self.seed = seed
+        self.skip_tokens = skip_tokens
         self.eos_id = tokenizer.eos_token_id
         self.bos_id = tokenizer.bos_token_id
 
@@ -157,11 +162,15 @@ class PackedDataset(IterableDataset):
         """Load all sources as streaming datasets, interleave by weight."""
         datasets = []
         weights = []
+        
+        # Calculate approximate total rows to skip across all datasets (assuming ~1000 tokens/row)
+        total_skip_rows = self.skip_tokens // 1000
 
         for src in self.sources:
             ds = load_dataset(
                 src.hf_path,
                 name=src.hf_subset,
+                data_dir=src.data_dir,
                 split=src.split,
                 streaming=True,
             )
@@ -174,6 +183,16 @@ class PackedDataset(IterableDataset):
             # Rename text column to "text" for uniformity
             if src.text_column != "text":
                 ds = ds.rename_column(src.text_column, "text")
+
+            # Strip all other metadata columns so interleave_datasets can align them perfectly
+            ds = ds.select_columns(["text"])
+
+            # Native HF skip for blazing fast resuming
+            if total_skip_rows > 0:
+                rows_to_skip = int(total_skip_rows * src.weight)
+                if rows_to_skip > 0:
+                    print(f"⚡ Fast-skipping {rows_to_skip:,} rows of {src.name} natively...")
+                    ds = ds.skip(rows_to_skip)
 
             datasets.append(ds)
             weights.append(src.weight)
@@ -252,20 +271,60 @@ def create_dataloader(
     num_workers: int = 2,
     tokenizer_name: str = "mistralai/Mistral-7B-v0.1",
 ) -> DataLoader:
-    """Create a streaming DataLoader for the specified training phase.
-
-    Args:
-        phase:       1 or 2 — selects the data mix
-        batch_size:  micro batch size (per GPU step, before grad accum)
-        seq_len:     sequence length for packing (default 4096)
-        total_tokens: stop after this many tokens (None = exhaust dataset)
-        seed:        random seed for reproducible interleaving
-        num_workers:  DataLoader workers (keep low for streaming)
-        tokenizer_name: HF tokenizer to use
-
-    Returns:
-        DataLoader yielding batches of {input_ids, labels} tensors
+    """Create a DataLoader for the specified training phase.
+    
+    Automatically checks for a pre-tokenized binary file on the Modal volume.
+    If found, uses ultra-fast numpy.memmap. Otherwise, falls back to HF streaming.
     """
+    import os
+    import numpy as np
+    from torch.utils.data import Dataset
+
+    # Look for pre-tokenized file
+    if total_tokens is not None:
+        bin_filename = f"phase{phase}_{total_tokens // 1_000_000}M.bin"
+    else:
+        bin_filename = f"phase{phase}_1000M.bin"  # default phase 1 fallback
+
+    bin_path = f"/checkpoints/data/{bin_filename}"
+
+    if os.path.exists(bin_path):
+        print(f"🚀 Found pre-tokenized dataset! Loading via memmap: {bin_path}")
+        
+        class MemmapDataset(Dataset):
+            def __init__(self, bin_path: str, seq_len: int = 4096, rank: int = 0, world_size: int = 1):
+                super().__init__()
+                self.seq_len = seq_len
+                self.rank = rank
+                self.world_size = world_size
+                self.data = np.memmap(bin_path, dtype=np.uint16, mode='r')
+                self.length = len(self.data) // seq_len
+
+            def __len__(self) -> int:
+                return self.length // self.world_size
+
+            def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+                global_idx = idx * self.world_size + self.rank
+                start = global_idx * self.seq_len
+                end = start + self.seq_len
+                chunk = self.data[start:end].astype(np.int64)
+                ids = torch.tensor(chunk, dtype=torch.long)
+                return {"input_ids": ids, "labels": ids.clone()}
+
+        rank = int(os.environ.get("RANK", "0"))
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        dataset = MemmapDataset(bin_path=bin_path, seq_len=seq_len, rank=rank, world_size=world_size)
+        
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=True,
+            shuffle=True,  # memmap allows true random access shuffling
+        )
+
+    print(f"⚠️ Pre-tokenized file not found at {bin_path}. Falling back to HuggingFace streaming.")
     sources = PHASE_1_SOURCES if phase == 1 else PHASE_2_SOURCES
     tokenizer = get_tokenizer(tokenizer_name)
 
